@@ -1,0 +1,234 @@
+
+#===============================================================================
+#================= Sourcing corn from Queensland ===============================
+#===============================================================================
+
+#======================Library to read excel File===============================
+library(readxl)
+#======================Library to read text File ===============================
+library(readr)
+#======================Library to use SummarizeColumsn==========================
+library(mlr)
+#======================Library to summarize by group============================
+library(DBI)
+library(proto)
+library(gsubfn)
+library(RSQLite)
+library(sqldf)
+library(lubridate)
+#===============================================================================
+#======================= Data Preprocessing ====================================
+#===============================================================================
+
+#LOad File
+Truck_Data <- read_delim("S:/CHEDEVIA/Analytics/Corn Project/Corn.txt","\t", escape_double = FALSE, trim_ws = TRUE)
+#Change columns format to date
+Truck_Data$`Date/Time`<-as.POSIXct(Truck_Data$`Date/Time`, format = "%m/%d/%Y %H:%M")
+#Change columns from chr to factor
+Truck_Data$Munit<-as.factor(Truck_Data$Munit)
+#Check NA Values
+sum(is.na(Truck_Data))
+#There are 9386 NA Values
+sum(is.na(Truck_Data$Lat))
+#Only 185 with NA Latitude, those values are removed 
+Truck_Data_Clean<-subset(Truck_Data,Truck_Data$Lat!='NA')
+#Check other NA's
+summarizeColumns(Truck_Data_Clean)
+#The Shock does not have any value it is remove
+Truck_Data_Clean<-subset(Truck_Data_Clean,select=c(-(which( colnames(Truck_Data_Clean)=="Shock" ))))
+#There are only 6 Records across the data with no values, these are removed.
+Truck_Data_Clean<-subset(Truck_Data_Clean,Truck_Data_Clean$Battery !='NA')
+#There are 1611 records with no data on the Temp Probe in the meantime, the 
+#Data is replaced by the Temp Ambient
+summarizeColumns(Truck_Data_Clean)
+#Replace Temp Probe by Temp when there are no values
+Truck_Data_Clean$`Temp Probe`<-ifelse(is.na(Truck_Data_Clean$`Temp Probe`),Truck_Data_Clean$Temperature,Truck_Data_Clean$`Temp Probe`)
+summarizeColumns(Truck_Data_Clean)
+#Select dates > March
+Truck_Data_Clean<-subset(Truck_Data_Clean,Truck_Data_Clean$`Date/Time` >='2018-03-23')
+
+#Now we record the data to see the improvements.
+write.table(Truck_Data_Clean, file = "S:/CHEDEVIA/Analytics/Corn Project/Truck_Data_Clean.csv",  col.names = NA, sep = ",",  qmethod = "double") 
+
+
+#Now let's add some routes
+#Extracting the post code
+Truck_Data_Clean$Post_Code<-as.numeric(substr(Truck_Data_Clean$Address,nchar(Truck_Data_Clean$Address)-(4-1),
+                                            nchar(Truck_Data_Clean$Address)))
+#Replace missing post code with a value
+subset(Truck_Data_Clean,is.na(Truck_Data_Clean$Post_Code))
+#Column to update
+column_to_update<-which( colnames(Truck_Data_Clean)=="Post_Code" )
+
+for (i in 1:nrow(Truck_Data_Clean)){
+  Truck_Data_Clean[i,column_to_update]<-ifelse(is.na(Truck_Data_Clean[i,column_to_update]),Truck_Data_Clean[i-1,column_to_update],Truck_Data_Clean[i,column_to_update])
+}
+#There are no missing postcodes
+subset(Truck_Data_Clean,is.na(Truck_Data_Clean$Post_Code))
+
+#Check how many points are per day
+#Add just a date Column
+Truck_Data_Clean$Date<-as.Date(Truck_Data_Clean$`Date/Time`, format = "%m-%d-%y")
+#Check how many points per day.
+sqldf("Select Date, count(Date) from Truck_Data_Clean group by Date")
+#There are only two days that have one point of data, they are removed from the data
+Truck_Data_Clean<-subset(Truck_Data_Clean, Truck_Data_Clean$Date>'2018-04-19')
+Truck_Data_Clean<-subset(Truck_Data_Clean, Truck_Data_Clean$Date!='2018-05-17')
+sqldf("Select Date, count(Date) from Truck_Data_Clean group by Date")
+#Now the end points are the post code 2795 they are marked as end point
+Truck_Data_Clean$Route<-ifelse(Truck_Data_Clean$Post_Code==2795,"Factory","0")
+#Create a TO Date/Time Column to calculate duration
+Truck_Data_Clean$`To Date/Time`<-Truck_Data_Clean$`Date/Time`
+#Assign the following date to the "To Date/Time" Column
+column_to_update<-which( colnames(Truck_Data_Clean)=="To Date/Time" )
+for (i in 1:(nrow(Truck_Data_Clean))-1){
+  Truck_Data_Clean[i,column_to_update]<-Truck_Data_Clean[i+1,1]}
+#Calculate Duration between points
+Truck_Data_Clean$Duration<-as.numeric(difftime(Truck_Data_Clean$`To Date/Time`,Truck_Data_Clean$`Date/Time`,"mins"))/60
+#Remove the To Date/Time Colum
+Truck_Data_Clean$`To Date/Time`<-NULL
+#Assign a Trip Column
+Truck_Data_Clean$TripNumber<-as.numeric(0)
+
+#Assign a trip number
+column_to_update<-which( colnames(Truck_Data_Clean)=="TripNumber" )
+column_for_if<-which( colnames(Truck_Data_Clean)=="Route" )
+
+for (i in 2:(nrow(Truck_Data_Clean)-1)){
+  Truck_Data_Clean[i,column_to_update]<-ifelse(Truck_Data_Clean[i-1,column_for_if]=="Factory"&Truck_Data_Clean[i,column_for_if]!="Factory",
+         Truck_Data_Clean[i-1,column_to_update]+1,Truck_Data_Clean[i-1,column_to_update])
+  
+}
+#Remove the last row
+Truck_Data_Clean<-Truck_Data_Clean[-(nrow(Truck_Data_Clean)),]
+
+#Duration in Hours
+Truck_Data_Clean$`Duration in Hours`<-Truck_Data_Clean$Duration/60
+#Add a filter to know the time spend at the factory
+Truck_Data_Clean$`Time at the Factory`<-0
+#Function to know when the Truck starts to deliver the product into the factory
+#Select a minimum Tilt
+Minimum_Tilt<-27
+#Run the function
+column_to_update<-which( colnames(Truck_Data_Clean)=="Time at the Factory" )
+column_for_if<-which( colnames(Truck_Data_Clean)=="Route" )
+
+
+for (i in 2:(nrow(Truck_Data_Clean)-1)){
+  
+  Truck_Data_Clean[i,column_to_update]<-ifelse(Truck_Data_Clean[i-1,column_for_if]!="Factory"&
+                                                 Truck_Data_Clean[i,column_for_if]=="Factory",1,
+                                   ifelse(Truck_Data_Clean[i+1,column_for_if]=="Factory"&
+                                            Truck_Data_Clean[i,column_for_if]=="Factory"&
+                                          Truck_Data_Clean[i,7]<Minimum_Tilt,Truck_Data_Clean[i-1,column_to_update],0))
+}
+
+#Add a Grower pick up
+Truck_Data_Clean$Grower<-0
+#Run a function to find  a grower pick up point
+column_to_update<-which( colnames(Truck_Data_Clean)=="Grower" )
+column_for_if<-which( colnames(Truck_Data_Clean)=="Post_Code" )
+column_for_if2<-which( colnames(Truck_Data_Clean)=="Route" )
+for (i in 2:nrow(Truck_Data_Clean)){
+Truck_Data_Clean[i,column_to_update]<-ifelse((Truck_Data_Clean[i,column_for_if]=='2728'|Truck_Data_Clean[i,column_for_if]=='2804'|
+                                  Truck_Data_Clean[i,column_for_if]=='2818'|Truck_Data_Clean[i,column_for_if]=='2821'|
+                                  Truck_Data_Clean[i,column_for_if]=='2830'|Truck_Data_Clean[i,column_for_if]=='2831'|
+                                  Truck_Data_Clean[i,column_for_if]=='3875'|Truck_Data_Clean[i,column_for_if]=='4313'|
+                                  Truck_Data_Clean[i,column_for_if]=='4341'|Truck_Data_Clean[i,column_for_if]=='4342'|
+                                  Truck_Data_Clean[i,column_for_if]=='4343'|Truck_Data_Clean[i,column_for_if]=='4387')&
+                                Truck_Data_Clean[i-1,column_to_update]<Truck_Data_Clean[i,column_for_if],
+                               Truck_Data_Clean[i,column_for_if],
+                               ifelse(Truck_Data_Clean[i,column_for_if2]!="Factory",Truck_Data_Clean[i-1,column_to_update],0))
+}
+maximum<-0
+column_to_update<-which( colnames(Truck_Data_Clean)=="Grower" )
+column_for_if<-which( colnames(Truck_Data_Clean)=="Post_Code" )
+column_for_if2<-which( colnames(Truck_Data_Clean)=="Route" )
+
+for (i in (nrow(Truck_Data_Clean)-1):1){
+  
+  if(Truck_Data_Clean[i+1,column_for_if2]=='Factory'){maximum<-Truck_Data_Clean[i,column_to_update]}
+  Truck_Data_Clean[i,column_to_update]<-ifelse(Truck_Data_Clean[i,column_to_update]<maximum,0,
+                                               Truck_Data_Clean[i,column_to_update])
+}
+for (i in 1:(nrow(Truck_Data_Clean)-1)){
+Truck_Data_Clean[i,column_to_update]<-ifelse(Truck_Data_Clean[i,column_to_update]==Truck_Data_Clean[i,column_for_if],
+                                             0,Truck_Data_Clean[i,column_to_update])
+}
+
+#Check odd values like negative time
+subset(Truck_Data_Clean,Truck_Data_Clean$`Duration in Hours`<0|Truck_Data_Clean$`Duration in Hours`>=100)
+#Remove odd values
+Truck_Data_Clean$`Duration in Hours`<- ifelse(Truck_Data_Clean$Duration<=0|Truck_Data_Clean$Duration>=100,
+                                              0,Truck_Data_Clean$`Duration in Hours`)
+
+Truck_Data_Clean$Duration<- ifelse(Truck_Data_Clean$Duration<0|Truck_Data_Clean$Duration>=100,
+                                              0,Truck_Data_Clean$Duration)
+#Check odd values like negative time
+subset(Truck_Data_Clean,Truck_Data_Clean$`Duration in Hours`<0|Truck_Data_Clean$`Duration in Hours`>=100)
+
+#Change columns for the time spend
+Truck_Data_Clean$Grower<-ifelse(Truck_Data_Clean$Grower!=0,Truck_Data_Clean$`Duration in Hours`,0)
+Truck_Data_Clean$`Time at the Factory`<-ifelse(Truck_Data_Clean$`Time at the Factory`!=0,
+                                               Truck_Data_Clean$`Duration in Hours`,0)
+#create new columns for temperature
+Truck_Data_Clean$Temp_Probe_during_Trip<-ifelse(Truck_Data_Clean$Grower!=0,Truck_Data_Clean$`Temp Probe`,0)
+Truck_Data_Clean$Temp_during_Trip      <-ifelse(Truck_Data_Clean$Grower!=0,Truck_Data_Clean$Temperature,0)
+
+Truck_Data_Clean$Temp_Probe_at_Factory<-ifelse(Truck_Data_Clean$`Time at the Factory`!=0,Truck_Data_Clean$`Temp Probe`,0)
+Truck_Data_Clean$Temp_Probe_Total<-ifelse(Truck_Data_Clean$`Time at the Factory`!=0|Truck_Data_Clean$Grower!=0,
+                                    Truck_Data_Clean$`Temp Probe`,0)
+Truck_Data_Clean$Time_Total<-ifelse(Truck_Data_Clean$`Time at the Factory`!=0|Truck_Data_Clean$Grower!=0,
+                                    Truck_Data_Clean$`Duration in Hours`,0)
+
+
+Truck_Data_Clean$Temp_at_Factory<-ifelse(Truck_Data_Clean$`Time at the Factory`!=0,Truck_Data_Clean$Temperature,0)
+Truck_Data_Clean$Temp_Total<-ifelse(Truck_Data_Clean$`Time at the Factory`!=0|Truck_Data_Clean$Grower!=0,
+                                    Truck_Data_Clean$Temperature,0)
+#Summarize data
+Summary_Table_Date_group<-sqldf("Select Munit,Date,
+        sum(Grower) as Trip_Time,
+        avg(CASE WHEN Temp_during_Trip <> 0 THEN Temp_during_Trip ELSE NULL END) as Temp_during_Trip,
+        avg(CASE WHEN Temp_Probe_during_Trip <> 0 THEN Temp_Probe_during_Trip ELSE NULL END) as Av_trip_temp_probe,
+        sum(`Time at the Factory`), 
+        avg(CASE WHEN Temp_at_Factory <> 0 THEN Temp_at_Factory ELSE NULL END) as Temp_at_Factory,
+        avg(CASE WHEN Temp_Probe_at_Factory <> 0 THEN Temp_Probe_at_Factory ELSE NULL END) as Temp_Probe_at_Factory,
+        sum(Time_Total),
+        avg(Temp_Total),
+        avg(Temp_Probe_Total)
+      from Truck_Data_Clean where Time_Total>0
+      group by Munit,date" )
+
+Summary_Table_Trip_group<-sqldf("Select Munit,TripNumber,
+        sum(Grower) as Trip_Time,
+        avg(CASE WHEN Temp_Probe_during_Trip <> 0 THEN Humidity ELSE NULL END) as Av_Humidity_Trip,
+        avg(CASE WHEN Temp_Probe_at_Factory <> 0 THEN Humidity ELSE NULL END) as Av_Humidity_Factory,
+        avg(CASE WHEN Temp_Probe_Total <> 0 THEN Humidity ELSE NULL END) as Av_Humidity_Total,                                
+        avg(CASE WHEN Temp_during_Trip <> 0 THEN Temp_during_Trip ELSE NULL END) as AvTemp_during_Trip,
+        avg(CASE WHEN Temp_Probe_during_Trip <> 0 THEN Temp_Probe_during_Trip ELSE NULL END) as Av_trip_temp_probe,
+        sum(`Time at the Factory`), 
+        avg(CASE WHEN Temp_at_Factory <> 0 THEN Temp_at_Factory ELSE NULL END) as Av_Temp_at_Factory,
+        avg(CASE WHEN Temp_Probe_at_Factory <> 0 THEN Temp_Probe_at_Factory ELSE NULL END) as Av_Temp_Probe_at_Factory,
+        sum(Time_Total),
+        avg(Temp_Total),
+        avg(Temp_Probe_Total)
+      from Truck_Data_Clean where Time_Total>0
+      group by Munit,TripNumber" )
+
+#Record the final file clean with the trip number
+#Now we record the data to see the improvements.
+write.table(Truck_Data_Clean, file = "S:/CHEDEVIA/Analytics/Corn Project/Truck_Data_With_TripNumber.csv",
+            col.names = NA, 
+            sep = ",",  qmethod = "double") 
+
+#Load Quality file
+Quality <- read_excel("S:/CHEDEVIA/Analytics/Quality.xlsx", col_types = c("date", "text", "text", 
+                                            "text", "text", "numeric", "date", "date", "date", "numeric", "numeric", 
+                                            "numeric"))
+#Join summarize table group by trip with the quality file
+Final<-sqldf("Select * from Summary_Table_Trip_group join Quality on Quality.TripNumber = Summary_Table_Trip_group.TripNumber")
+#Save data to graph in Power BI
+write.table(Final, file = "S:/CHEDEVIA/Analytics/Corn Project/Final.csv",
+            col.names = NA, 
+            sep = ",",  qmethod = "double") 
+  
